@@ -30,6 +30,8 @@ ctx.on('webserver/entry-url', (baseUrl, entries) => {
 
 为什么不再用 `ctx.connection.authenticatedUrl`：从 0.2.3 起该方法从 `ctx.connection` 迁入了 Token Provider 内部的 `BrowserAuth` 实例，且 launch token 是随机盐、只在进程内存的 `WeakMap` 里，外部无法重算。因此改成「捕获官方自己生成的入口 URL」。
 
+> 实现细节：本插件可能比 Token Provider 更早注册监听，同步 emit 期间读到的 `entries` 可能为空，故把读取推迟到微任务/下一拍，等所有监听器 push 完再挑带 `token=` 的入口。
+
 **兼容回退**：若某些旧版本的 Host 仍在 `ctx.connection` 上暴露 `authenticatedUrl`，插件会检测到并每秒轮询、最多 60 次，直接取 URL 落盘（只用在新接口缺位时）。
 
 写入采用「临时文件 + `rename` 原子替换」，内容与已存在文件相同则跳过，权限 `0o600`。

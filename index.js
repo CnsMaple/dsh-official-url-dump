@@ -68,9 +68,17 @@ export function apply(ctx, config = {}) {
 
   // 主路径：监听官方在启动时 spawn 的入口 URL 事件。
   // global: true 保证不受 webServer isolation 过滤影响，稳定收到。
+  // 注意：本插件可能比 Token Provider 更早注册监听，emit 时其它监听器（含 Token Provider）
+  // 会同步往 entries 里 push 入口。因此在当前同步栈里读到的 entries 可能是空的。
+  // 把读取推迟到微任务/下一拍，等整轮 emit 的同步监听器都跑完后再从同一数组里挑。
   const off = ctx.on('webserver/entry-url', (baseUrl, entries) => {
-    const url = pickTokenEntry(entries);
-    if (url) writeUrl(url);
+    const pick = () => {
+      const url = pickTokenEntry(entries);
+      if (url) writeUrl(url);
+    };
+    if (typeof queueMicrotask === 'function') queueMicrotask(pick);
+    const t = setTimeout(pick, 0);
+    t.unref?.();
   }, { global: true });
 
   // 兼容/兜底路径：旧版 host 在 ctx.connection 上有 authenticatedUrl。
