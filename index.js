@@ -1,13 +1,17 @@
 /**
  * dsh-official-url-dump — Host half.
  *
- * 在官方 DeepSeek Harness 桌面版启动时，取得「带 launch token 的 Web 地址」并原子写入一个
- * 文件（默认 ~/.dsh/dsh-go-ssh/official-url.txt）。dsh-go 的 probe 复用守护只读这个文件，
+ * 在 DeepSeek Harness 启动时取得「带 launch token 的 Web 地址」并原子写入一个文件
+ *（默认 ~/.dsh/dsh-go-ssh/official-url.txt）。dsh-go 的 probe 复用守护只读这个文件，
  * 不再需要抓日志或扫描进程内存。
  *
- * 原理：桌面 host 自己就是用 ctx.connection.authenticatedUrl(`${protocol}//127.0.0.1:${port}`)
- * 拿到带 ?token= 的地址（见 dsh-desktop-host/lib/index.js）。本插件 inject 同一批服务，调同一
- * 方法，把结果落盘。
+ * 历史（为什么会改）：0.2.x 早期官方 desktop host 在 `ctx.connection` 上暴露
+ * `authenticatedUrl(base)`；从 0.2.3 起该方法迁入 Token Provider 插件
+ * `@deepseek-ai/dsh-host-authentication-token` 的 `BrowserAuth` 实例内部，
+ * 不再挂在 `ctx.connection` 上，且 launch token 是由随机盐生成、只存在进程内的
+ * WeakMap 里，无法从外部重算。因此本插件改为监听官方生成的入口 URL：
+ * Token Provider 会在 `webserver/entry-url` 事件里 push 一条带 `?token=` 的入口，
+ * 本插件捕获它并落盘；若旧版本仍暴露 `ctx.connection.authenticatedUrl`，作为兼容回退。
  *
  * @module dsh-official-url-dump
  */
@@ -16,53 +20,90 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const name = 'official-url-dump';
-export const inject = ['connection', 'webServer'];
+// webServer 用来在回退路径里读取端口/协议；entry-url 事件走 global 监听，无需依赖其 isolation。
+export const inject = ['webServer'];
 
 export function apply(ctx, config = {}) {
   const file =
     (config && typeof config.file === 'string' && config.file) ||
     path.join(os.homedir(), '.dsh', 'dsh-go-ssh', 'official-url.txt');
 
-  let done = false;
-  let tries = 0;
+  let written = undefined;
   let timer;
+  let tries = 0;
 
-  const writeOnce = () => {
-    tries += 1;
+  const writeUrl = (url) => {
+    if (!url || !String(url).includes('token=')) return false;
+    const value = String(url).trim();
+    // 已有相同内容就不重复落盘（避免每次 emit 都写）。
     try {
-      const port = ctx.webServer && ctx.webServer.port;
-      const protocol = (ctx.webServer && ctx.webServer.protocol) || 'http:';
-      if (!port) return false; // 还没 listen，稍后重试
-      const base = `${protocol}//127.0.0.1:${port}`;
-      const url = ctx.connection.authenticatedUrl(base);
-      if (!url || !String(url).includes('token=')) return false;
+      if (fs.readFileSync(file, 'utf8').trim() === value) {
+        written = value;
+        return true;
+      }
+    } catch {}
+    try {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const tmp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, `${url}\n`, { mode: 0o600 });
+      fs.writeFileSync(tmp, `${value}\n`, { mode: 0o600 });
       fs.renameSync(tmp, file); // 原子替换
-      done = true;
+      written = value;
       console.error(`[official-url-dump] wrote ${file}`);
       return true;
     } catch (e) {
-      console.error(`[official-url-dump] ${e && e.message ? e.message : e}`);
+      console.error(`[official-url-dump] write failed: ${e && e.message ? e.message : e}`);
       return false;
     }
   };
 
-  // 启动即试；webServer 可能尚未 listen，失败就每 1s 重试，最多 60 次。
-  const tick = () => {
-    if (writeOnce()) return;
-    if (tries >= 60) {
-      console.error('[official-url-dump] gave up after 60 tries');
-      return;
+  // 从一次 entry-url 事件的 entries 中挑出带 token 的入口。
+  const pickTokenEntry = (entries) => {
+    if (!Array.isArray(entries)) return undefined;
+    // 优先 label 为 'dsh web' 的入口，其次任意带 token 的。
+    const web = entries.find((e) => e && /dsh web/i.test(String(e.label || '')) && String(e.url || '').includes('token='));
+    if (web) return web.url;
+    const any = entries.find((e) => e && String(e.url || '').includes('token='));
+    return any ? any.url : undefined;
+  };
+
+  // 主路径：监听官方在启动时 spawn 的入口 URL 事件。
+  // global: true 保证不受 webServer isolation 过滤影响，稳定收到。
+  const off = ctx.on('webserver/entry-url', (baseUrl, entries) => {
+    const url = pickTokenEntry(entries);
+    if (url) writeUrl(url);
+  }, { global: true });
+
+  // 兼容/兜底路径：旧版 host 在 ctx.connection 上有 authenticatedUrl。
+  // 若存在，则轮询端口就绪后直接取 URL；新版走上面的 entry-url 事件。
+  const tryLegacy = () => {
+    if (written) return;
+    const conn = ctx.get && ctx.get('connection');
+    if (!conn || typeof conn.authenticatedUrl !== 'function') return;
+    const ws = ctx.get && ctx.get('webServer');
+    const port = ws && ws.port;
+    if (!port) return;
+    const protocol = (ws && ws.protocol) || 'http:';
+    try {
+      writeUrl(conn.authenticatedUrl(`${protocol}//127.0.0.1:${port}`));
+    } catch (e) {
+      console.error(`[official-url-dump] legacy authenticatedUrl failed: ${e && e.message ? e.message : e}`);
     }
-    timer = setTimeout(tick, 1000);
+  };
+  const tickLegacy = () => {
+    if (written) return;
+    tryLegacy();
+    if (written || tries >= 60) return;
+    tries += 1;
+    timer = setTimeout(tickLegacy, 1000);
     timer.unref?.();
   };
-  tick();
+  // 仅当旧接口存在时才启动轮询，避免新版空转。
+  if (ctx.get && typeof (ctx.get('connection') || {}).authenticatedUrl === 'function') {
+    tickLegacy();
+  }
 
-  // 若插件被重载/卸载，清理定时器。
   ctx.on?.('dispose', () => {
     if (timer) clearTimeout(timer);
+    if (typeof off === 'function') off();
   });
 }
