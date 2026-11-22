@@ -1,0 +1,20 @@
+{
+  "name": "dsh-official-url-dump",
+  "version": "0.1.0",
+  "description": "Dump the authenticated DeepSeek Harness desktop web URL (with launch token) to a file so dsh-go probe reuse can read it. Replaces log-scraping / memory-scanning.",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

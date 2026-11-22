@@ -1,0 +1,5 @@
+# dsh-official-url-dump：把官方 desktop 的带 token Web 地址写到文件，供 dsh-go probe 复用。
+# 不写死路径：插件默认写到 <用户主目录>/.dsh/dsh-go-ssh/official-url.txt（跨机器通用）。
+- insert:
+    - id: official-url-dump
+      name: dsh-official-url-dump
